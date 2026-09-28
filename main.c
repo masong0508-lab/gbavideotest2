@@ -8,6 +8,10 @@ typedef unsigned int   u32;
 #define REG32(a) (*(volatile u32*)(a))
 #define REG_DISPCNT    REG16(0x04000000)
 #define REG_DISPSTAT   REG16(0x04000004)
+#define REG_SOUND1CNT_L REG16(0x04000060)
+#define REG_SOUND1CNT_H REG16(0x04000062)
+#define REG_SOUND1CNT_X REG16(0x04000064)
+#define REG_SOUNDCNT_L  REG16(0x04000080)
 #define REG_SOUNDCNT_H REG16(0x04000082)
 #define REG_SOUNDCNT_X REG16(0x04000084)
 #define REG_TM0CNT_L   REG16(0x04000100)
@@ -250,6 +254,25 @@ static void make_highlight(void) {
 #define ROW_Y(i) (15 + 23 * (i))                /* text row centres from the layout guide */
 #define COL_CX 192
 
+/* Easter-egg jingle: the lead ("PCMSynth") track of Woover.mid, converted
+   to GBA tone-channel-1 note events. Each entry is {frequency register
+   value, duration in vblanks (~16.74ms each)}. freq reg = 2048 - 131072/Hz,
+   Hz from the MIDI note number (A4=440Hz). Notes taken from the original
+   MIDI's note-on times, quantised to the GBA's ~59.7Hz vblank rate. */
+static const struct { u16 freq; u16 frames; } tune[] = {
+    {1417, 16},   /* G#3  */
+    {1297, 122},  /* F3   */
+    {1602, 30},   /* D4   */
+    {1452, 82},   /* A3   */
+    {1517, 18},   /* B3   */
+    {1517, 17},   /* B3   */
+    {1517, 18},   /* B3   */
+    {1339, 139},  /* F#3  */
+    {1155, 3},    /* D3   */
+    {1205, 57},   /* D#3  */
+};
+#define TUNE_LEN (sizeof(tune) / sizeof(tune[0]))
+
 /* Secret screen (Konami code on the main menu). Same format as the menu
    background: 240x160 8-bit, palette idx 254 = black, 255 = white. */
 static void secret(void) {
@@ -259,14 +282,37 @@ static void secret(void) {
     for (int i = 0; i < 19200; i++) VRAM_PAGE0[i] = secret_bg[i];
     for (int i = 0; i < 128; i++) OAM[i * 4] = 0x200;
     text(120 - text_w("YOU FOUND IT") / 2, 76, "YOU FOUND IT");
+
+    /* Kick off the jingle on PSG channel 1: full volume, no envelope decay,
+       50% duty, routed to both speakers. Plays once through; the screen
+       cuts back to the menu the instant the last note ends (or sooner if
+       the player presses a button). */
+    REG_SOUNDCNT_L = 0x1177;               /* ch1 -> L+R, max master volume */
+    REG_SOUNDCNT_H = 0x0002;               /* PSG output ratio 100% */
+    REG_SOUNDCNT_X = 0x80;                 /* master sound enable */
+    REG_SOUND1CNT_L = 0;                   /* no frequency sweep */
+    REG_SOUND1CNT_H = 0xF080;              /* vol 15, no envelope, 50% duty */
+    int mi = 0;
+    REG_SOUND1CNT_X = tune[0].freq | 0x8000;
+    int mframe = tune[0].frames;
+
     u16 prev = (u16)(~REG_KEYINPUT & 0x3FF);
     for (;;) {
         wait_vb();
+        if (--mframe <= 0) {
+            mi++;
+            if (mi >= TUNE_LEN) break;      /* last note finished: cut back to menu */
+            REG_SOUND1CNT_X = tune[mi].freq | 0x8000;
+            mframe = tune[mi].frames;
+        }
         u16 k = (u16)(~REG_KEYINPUT & 0x3FF);
         u16 hit = k & ~prev;
         prev = k;
-        if (hit) return;
+        if (hit) break;
     }
+
+    REG_SOUND1CNT_H = 0;                   /* silence channel 1 */
+    REG_SOUNDCNT_X = 0;                    /* master sound off */
 }
 
 /* returns chosen index, or -1 for B (only when allow_back) */
