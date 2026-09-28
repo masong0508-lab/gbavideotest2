@@ -250,11 +250,15 @@ static int menu(const char *const *items, int allow_back) {
 static void controls(void) {
     menu_setup();
     for (int y = 10; y < 150; y++) for (int x = 10; x < 230; x++) put(x, y, 254);
-    text(20, 18, "CONTROLS");
-    text(20, 44, "UP DOWN   MOVE");
-    text(20, 60, "A OR START   SELECT");
-    text(20, 76, "B   BACK");
-    text(20, 92, "SELECT   MENU IN VIDEO");
+    text(20, 16, "CONTROLS");
+    text(20, 34, "UP DOWN   MOVE");
+    text(20, 48, "A OR START   SELECT");
+    text(20, 62, "B   BACK");
+    text(20, 80, "IN VIDEO");
+    text(20, 94, "A UP   PAUSE");
+    text(20, 108, "A RIGHT   FAST FORWARD");
+    text(20, 122, "A DOWN   REWIND");
+    text(20, 136, "SELECT   MENU");
     u16 prev = (u16)(~REG_KEYINPUT & 0x3FF);
     for (;;) {
         wait_vb();
@@ -275,6 +279,34 @@ static u32 chapter_tick(int p) {
 }
 
 /* ================= playback ================= */
+static void start_audio(u32 st) {
+    REG_IME = 0;
+    REG_SOUNDCNT_X = 0x80;
+    REG_SOUNDCNT_H = 0x0B04;
+    u32 c = st >> 1;
+    dec = c; ap = audio_start + c * (SAMPLES_PER_CHUNK / 2);
+    pred = 0; sidx = 0;
+    play_idx = 0; started = c; tick = st; fill_needed = 0;
+    decode_chunk(abuf[0]);
+    IRQ_VECTOR = (u32)irq_handler;
+    REG_DISPSTAT = 8;
+    REG_IF = 0xFFFF;
+    REG_IE = 1;
+    REG_IME = 1;
+}
+
+static void stop_audio(void) {
+    REG_IME = 0;
+    REG_IE = 0;
+    REG_DISPSTAT = 0;
+    REG_DMA1CNT = 0;
+    REG_TM0CNT_H = 0;
+    REG_SOUNDCNT_H = 0x0800;                /* reset FIFO A, silence */
+    REG_IF = 0xFFFF;
+}
+
+#define SEEK_STEP 4                         /* ticks (vblanks) per frame while seeking = 4x speed */
+
 static void play(u32 st) {
     REG_IME = 0;
     for (int i = 0; i < 256; i++) PALETTE[i] = palette_data[i];
@@ -282,38 +314,60 @@ static void play(u32 st) {
     for (int i = 0; i < 128; i++) OAM[i * 4] = 0x200;
     REG_DISPCNT = 4 | (1 << 10);
 
-    REG_SOUNDCNT_X = 0x80;
-    REG_SOUNDCNT_H = 0x0B04;
-
     unsigned count = (unsigned)(frames_end - frames_start) / FRAME_BYTES;
-    u32 c = st >> 1;
-    dec = c; ap = audio_start + c * (SAMPLES_PER_CHUNK / 2);
-    pred = 0; sidx = 0;
-    play_idx = 0; started = c; tick = st; fill_needed = 0;
-    decode_chunk(abuf[0]);
+    u32 maxpos = ((u32)count << 16) / 5486u;
+    if (maxpos > NCHUNKS * 2 - 2) maxpos = NCHUNKS * 2 - 2;
+    maxpos &= ~1u;
 
-    IRQ_VECTOR = (u32)irq_handler;
-    REG_DISPSTAT = 8;
-    REG_IF = 0xFFFF;
-    REG_IE = 1;
-    REG_IME = 1;
+    start_audio(st);
 
-    u32 last = st;
+    u32 last = st, pos = st;
+    int mode = 0;                           /* 0 play, 1 pause, 2 fast-forward, 3 rewind */
+    int paused = 0;
     int drawn = -1, pending = 0, page = 0;
+    u16 prev = (u16)(~REG_KEYINPUT & 0x3FF);
 
     for (;;) {
-        while (tick == last) {}
-        u32 t = tick;
-        last = t;
+        u32 t;
+        if (mode == 0) {
+            while (tick == last) {}
+            t = tick;
+            last = t;
+        } else {
+            wait_vb();
+            if (mode == 2) { pos += SEEK_STEP; if (pos > maxpos) pos = maxpos; }
+            if (mode == 3) { pos = pos > SEEK_STEP ? pos - SEEK_STEP : 0; }
+            t = pos;
+        }
 
-        if (!(REG_KEYINPUT & 4)) break;     /* SELECT: back to menu */
+        u16 k = (u16)(~REG_KEYINPUT & 0x3FF);
+        u16 hit = k & ~prev;
+        prev = k;
+        if (k & 4) break;                   /* SELECT: back to menu */
+
+        int a = k & 1;
+        if (a && (hit & 0x40)) paused ^= 1; /* A + Up: pause / resume */
+        if ((hit & 1) && (k & 0x40)) paused ^= 1;
+        int nm = paused ? 1 : 0;
+        if (a && (k & 0x10)) nm = 2;        /* A + Right: fast-forward */
+        else if (a && (k & 0x80)) nm = 3;   /* A + Down: rewind */
+
+        if (nm != mode) {
+            if (mode == 0) { pos = t > maxpos ? maxpos : t; stop_audio(); }
+            if (nm == 0) {                  /* resume: re-sync audio to the video position */
+                u32 s = pos & ~1u;
+                start_audio(s);
+                last = s; t = s;
+            }
+            mode = nm;
+        }
 
         if (pending) {
             page ^= 1;
             REG_DISPCNT = 4 | (1 << 10) | (page << 4);
             pending = 0;
         }
-        if (fill_needed) {
+        if (mode == 0 && fill_needed) {
             fill_needed = 0;
             decode_chunk(abuf[play_idx]);
         }
@@ -327,13 +381,7 @@ static void play(u32 st) {
         }
     }
 
-    REG_IME = 0;
-    REG_IE = 0;
-    REG_DISPSTAT = 0;
-    REG_DMA1CNT = 0;
-    REG_TM0CNT_H = 0;
-    REG_SOUNDCNT_H = 0x0800;                /* reset FIFO A, silence */
-    REG_IF = 0xFFFF;
+    stop_audio();
     REG_DISPCNT = 4 | (1 << 10);            /* back to page 0 */
 }
 
